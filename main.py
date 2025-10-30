@@ -1,13 +1,17 @@
 # main.py — API de busca + SEO (com debug e proxy opcional)
 from fastapi import FastAPI, Query
-import httpx, os, json, asyncio
+import httpx, os, json
 from dotenv import load_dotenv
 import google.generativeai as genai
 from urllib.parse import quote_plus
+from fastapi.responses import RedirectResponse
 
-load_dotenv()  # carrega .env
-
+load_dotenv()
 app = FastAPI(title="E-commerce SEO API")
+
+@app.get("/")
+def root():
+    return RedirectResponse("/docs")
 
 # 🔑 Variáveis de ambiente (NÃO colocar chaves direto no código!)
 GOOGLE_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
