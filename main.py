@@ -1,3 +1,4 @@
+# main.py — API de busca Mercado Livre (JSON/HTML) + SEO (Gemini)
 from fastapi import FastAPI, Query
 from fastapi.responses import RedirectResponse
 import httpx, os, json, re
