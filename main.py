@@ -1,8 +1,8 @@
-# main.py — E-commerce SEO API (Mercado Livre)
+# main.py — Baseline simples (JSON + HTML) com parser "solto"
 from fastapi import FastAPI, Query
 from fastapi.responses import RedirectResponse
 import os, json, re, html as html_unescape
-from urllib.parse import quote_plus, urlencode, urlparse
+from urllib.parse import quote_plus, urlencode
 
 import httpx
 from bs4 import BeautifulSoup
@@ -11,9 +11,9 @@ import google.generativeai as genai
 
 load_dotenv()
 
-app = FastAPI(title="E-commerce SEO API")
+app = FastAPI(title="E-commerce SEO API (baseline)")
 
-# ---- ENV ----
+# ---------------- ENV ----------------
 GOOGLE_KEY  = os.getenv("GOOGLE_API_KEY", "").strip()
 PROXY_BASE  = os.getenv("ML_PROXY_URL", "").strip()          # ex: https://api.zenrows.com/v1/?apikey=KEY&url=
 PROXY_EXTRA = os.getenv("ML_PROXY_EXTRA", "").strip()        # ex: &js_render=true&premium_proxy=true
@@ -22,9 +22,9 @@ USE_PROXY   = bool(PROXY_BASE)
 if GOOGLE_KEY:
     genai.configure(api_key=GOOGLE_KEY)
 
-# ---- Utils / Helpers ----
+# ---------------- Utils ----------------
 def build_target(raw_url: str, force_params: dict | None = None) -> str:
-    """Encapsula a URL real no proxy, adicionando PROXY_EXTRA e params forçados."""
+    """Encapsula a URL real no proxy (se houver)."""
     if not USE_PROXY:
         return raw_url
     target = f"{PROXY_BASE}{quote_plus(raw_url)}{PROXY_EXTRA}"
@@ -48,25 +48,12 @@ def price_to_number(txt: str | None) -> int | None:
     except Exception:
         return None
 
-BAD_TITLES = {"Publicidade", "Buscas relacionadas", "Perguntas relacionadas", "Tudo sobre", "Resumo dos Prós e Contras do iPhone"}
-
 def normalize_link(u: str | None) -> str | None:
+    """Apenas normaliza escapes comuns (mantemos simples)."""
     if not u:
         return None
     u = u.replace("\\u002F", "/").replace("$query_NoIndex_True", "").replace("$query", "")
     return html_unescape.unescape(u)
-
-def is_product_link(u: str | None) -> bool:
-    if not u:
-        return False
-    try:
-        p = urlparse(u)
-        host = (p.netloc or "").lower()
-        path = (p.path or "").lower()
-        # produto típico: produto.mercadolivre.com.br/MLB-... ou caminho com "mlb-"
-        return ("mercadolivre.com.br" in host) and ("mlb-" in path or "produto.mercadolivre.com.br" in host)
-    except Exception:
-        return False
 
 def make_prompt(q: str, items: list) -> str:
     return f"""
@@ -82,7 +69,7 @@ Entregue:
 - 3 FAQs curtas
 """
 
-# ---- Rotas básicas ----
+# ---------------- Rotas básicas ----------------
 @app.get("/")
 def root():
     return RedirectResponse("/docs")
@@ -93,12 +80,12 @@ async def health():
 
 @app.get("/debug/env")
 def debug_env():
-    def _mask(s: str, keep: int = 12):
+    def _mask(s: str, keep: int = 10):
         if not s: return ""
         return s[:keep] + "..." if len(s) > keep else s
     return {"use_proxy": USE_PROXY, "proxy_base_preview": _mask(PROXY_BASE), "proxy_extra": PROXY_EXTRA}
 
-# ---- Plano A: API JSON oficial (pode sofrer bloqueios) ----
+# ---------------- Plano A: API JSON oficial (pode bloquear) ----------------
 async def fetch_meli_json(query: str):
     base = "https://api.mercadolibre.com/sites/MLB/search"
     raw  = f"{base}?q={quote_plus(query)}&limit=5"
@@ -114,24 +101,6 @@ async def fetch_meli_json(query: str):
         return {"status": status, "headers": hdrs, "target": target, "raw_preview": text[:800], "json": data}
     except Exception as e:
         return {"status": 0, "target": target, "error": str(e), "headers": {}, "raw_preview": ""}
-
-    # 1) Proxy com render (se houver proxy)
-    if USE_PROXY:
-        target1 = build_target(raw, force_params={"js_render": "true"})
-        st1, tx1, hd1 = await get_text(target1, ua_hdrs)
-        tries.append({"status": st1, "target": target1, "headers": hd1, "raw_preview": tx1[:600], "html": tx1})
-
-        # 2) Proxy sem render (fallback)
-        if st1 >= 400 or len(tx1) < 1000:
-            target2 = build_target(raw, force_params={"js_render": "false"})
-            st2, tx2, hd2 = await get_text(target2, ua_hdrs)
-            tries.append({"status": st2, "target": target2, "headers": hd2, "raw_preview": tx2[:600], "html": tx2})
-
-    # 3) Tentar DIRETO (sem proxy) — MUITO ÚTIL quando proxy é marcado como bot
-    st3, tx3, hd3 = await get_text(raw, ua_hdrs)
-    tries.append({"status": st3, "target": raw, "headers": hd3, "raw_preview": tx3[:600], "html": tx3})
-
-    return tries
 
 @app.get("/meli/search")
 async def meli_search(q: str = Query(..., description="Produto a buscar (API JSON ML)")):
@@ -150,6 +119,7 @@ async def meli_search(q: str = Query(..., description="Produto a buscar (API JSO
     if not results:
         return {"message": "Sem resultados ou bloqueado.", "meli_status": meli["status"], "meli_preview": meli["raw_preview"]}
 
+    # IA (com modelo válido)
     seo_text = "(IA desativada: defina GOOGLE_API_KEY)"
     if GOOGLE_KEY:
         try:
@@ -160,62 +130,16 @@ async def meli_search(q: str = Query(..., description="Produto a buscar (API JSO
 
     return {"query": q, "results": results, "seo_text": seo_text}
 
-# ---- Plano B: HTML público (com extractor de JSON inline) ----
-def extract_from_inline_json(html: str) -> list[dict]:
+# ---------------- Plano B: HTML público (parser simples) ----------------
+def parse_ml_list_html_simple(html: str) -> list[dict]:
     """
-    Procura blobs JSON comuns em páginas do ML (pré-carregados ou em bundles).
+    Parser simples — o mesmo estilo que te retornou itens como 'Publicidade', etc.
+    (Sem filtros agressivos para garantir que apareçam resultados.)
     """
+    soup = BeautifulSoup(html, "lxml")
     items: list[dict] = []
 
-    # A) window.__PRELOADED_STATE__ = {...}
-    m = re.search(r"__PRELOADED_STATE__\s*=\s*({.*?});\s*</script>", html, flags=re.S)
-    # B) __NEXT_DATA__
-    if not m:
-        m = re.search(r"__NEXT_DATA__\"\s*:\s*({.*?})\s*</script>", html, flags=re.S)
-    # C) Qualquer blob que contenha results/permalink/title (bem permissivo)
-    if not m:
-        m = re.search(r"(\{[^<>{}]*\"results\"\s*:\s*\[.*?\}\])", html, flags=re.S)
-    if not m:
-        m = re.search(r"(\{[^<>{}]*\"permalink\"\s*:\s*\"https?://[^\"}]+\".*?\})", html, flags=re.S)
-
-    if not m:
-        return items
-
-    blob = m.group(1).replace("\\u002F", "/")
-
-    # Captura chaves usuais
-    links   = re.findall(r'"permalink"\s*:\s*"([^"]+)"', blob)
-    titles  = re.findall(r'"title"\s*:\s*"([^"]+)"', blob)
-    prices  = re.findall(r'"price"\s*:\s*([0-9]+)', blob)
-    thumbs  = re.findall(r'"thumbnail"\s*:\s*"([^"]+)"', blob)
-
-    n = max(len(links), len(titles), len(prices), len(thumbs), 0)
-    for i in range(n):
-        link  = normalize_link(links[i]) if i < len(links)  else None
-        title = (titles[i] if i < len(titles) else "").strip()
-        price = int(prices[i]) if i < len(prices) else None
-        thumb = normalize_link(thumbs[i]) if i < len(thumbs) else None
-
-        if not title or title in BAD_TITLES:
-            continue
-        if not is_product_link(link):
-            continue
-
-        items.append({"title": title, "price": price, "link": link, "thumbnail": thumb})
-        if len(items) >= 12:
-            break
-
-    return items
-
-def parse_ml_list_html(html: str) -> list[dict]:
-    # 0) Tenta primeiro os blobs JSON inline
-    items = extract_from_inline_json(html)
-    if items:
-        return items
-
-    # 1) JSON-LD
-    soup = BeautifulSoup(html, "lxml")
-    items = []
+    # A) JSON-LD (se tiver)
     for s in soup.find_all("script", {"type": "application/ld+json"}):
         txt = (s.string or s.text or "").strip()
         if not txt:
@@ -231,17 +155,16 @@ def parse_ml_list_html(html: str) -> list[dict]:
                     continue
                 title = (node.get("name") or "").strip()
                 link  = normalize_link(node.get("url"))
-                if not title or title in BAD_TITLES or not is_product_link(link):
-                    continue
-                price = None
                 offer = node.get("offers") or {}
+                price = None
                 if isinstance(offer, dict) and offer.get("price") is not None:
                     price = price_to_number(str(offer.get("price")))
-                items.append({"title": title, "price": price, "link": link, "thumbnail": None})
+                if title and link:
+                    items.append({"title": title, "price": price, "link": link, "thumbnail": None})
     if items:
         return items[:12]
 
-    # 2) Seletores de cartão (fallback)
+    # B) Seletores "cartão" — bem solto
     cards = soup.select('[data-testid="product"], .ui-search-result__wrapper, .ui-search-layout__item, li.ui-search-layout__item')
     for c in cards:
         a = c.select_one('a[href*="mercadolivre.com"]') or c.find("a", href=True)
@@ -250,9 +173,6 @@ def parse_ml_list_html(html: str) -> list[dict]:
         title_el = c.select_one('[data-testid="product-title"], h2.ui-search-item__title, .ui-search-item__title')
         title = (title_el.get_text(strip=True) if title_el else "").strip()
 
-        if not title or title in BAD_TITLES or not is_product_link(href):
-            continue
-
         img_el = c.select_one('img[data-src], img[src]')
         thumb = normalize_link((img_el.get("data-src") or img_el.get("src")) if img_el else None)
 
@@ -260,9 +180,24 @@ def parse_ml_list_html(html: str) -> list[dict]:
         price_txt = price_el.get_text(strip=True) if price_el else None
         price = price_to_number(price_txt)
 
-        items.append({"title": title, "price": price, "link": href, "thumbnail": thumb})
+        if href and title:
+            items.append({"title": title, "price": price, "link": href, "thumbnail": thumb})
         if len(items) >= 12:
             break
+    if items:
+        return items
+
+    # C) Regex fallback (permalink/title/price) — também bem permissivo
+    links  = re.findall(r'"permalink"\s*:\s*"([^"]+)"', html)
+    titles = re.findall(r'"title"\s*:\s*"([^"]+)"', html)
+    prices = re.findall(r'"price"\s*:\s*([0-9]+)', html)
+
+    for i, link in enumerate(links[:12]):
+        link = normalize_link(link)
+        title = (titles[i] if i < len(titles) else "").strip()
+        price = int(prices[i]) if i < len(prices) else None
+        if title and link:
+            items.append({"title": title, "price": price, "link": link, "thumbnail": None})
 
     return items
 
@@ -273,11 +208,10 @@ async def fetch_meli_html(query: str):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
     }
-    # 1ª tentativa com js_render=true (quando houver proxy)
     target = build_target(raw, force_params={"js_render": "true"}) if USE_PROXY else raw
     st1, tx1, hd1 = await get_text(target, ua_hdrs)
     tries = [{"status": st1, "target": target, "headers": hd1, "raw_preview": tx1[:600], "html": tx1}]
-    # Se falhar/curto, tenta sem render
+    # fallback sem render (a mesma lógica de quando testamos)
     if (st1 >= 400 or len(tx1) < 1000) and USE_PROXY:
         target2 = build_target(raw, force_params={"js_render": "false"})
         st2, tx2, hd2 = await get_text(target2, ua_hdrs)
@@ -285,7 +219,7 @@ async def fetch_meli_html(query: str):
     return tries
 
 @app.get("/meli/search_html")
-async def meli_search_html(q: str = Query(..., description="Produto a buscar (HTML público)")):
+async def meli_search_html(q: str = Query(..., description="Produto a buscar (HTML público — baseline)")):
     traces = await fetch_meli_html(q)
 
     html = None
@@ -296,11 +230,10 @@ async def meli_search_html(q: str = Query(..., description="Produto a buscar (HT
     if not html:
         return {"message": "Não foi possível obter HTML da busca.", "tries": traces}
 
-    results = parse_ml_list_html(html)
+    results = parse_ml_list_html_simple(html)
     if not results:
-        return {"message": "HTML obtido, mas nenhum item foi parseado.", "tries": traces[:1], "html_preview": html[:500]}
+        return {"message": "HTML obtido, mas nenhum item foi parseado.", "tries": traces[:1], "html_preview": html[:600]}
 
-    # IA opcional
     seo_text = "(IA desativada: defina GOOGLE_API_KEY)"
     if GOOGLE_KEY:
         try:
@@ -311,7 +244,7 @@ async def meli_search_html(q: str = Query(..., description="Produto a buscar (HT
 
     return {"query": q, "results": results, "seo_text": seo_text}
 
-# (Opcional) rota para depurar HTML retornado
+# (opcional) rota para inspecionar o HTML retornado
 @app.get("/meli/search_html_debug")
 async def meli_search_html_debug(q: str = Query(...)):
     traces = await fetch_meli_html(q)
