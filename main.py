@@ -115,6 +115,24 @@ async def fetch_meli_json(query: str):
     except Exception as e:
         return {"status": 0, "target": target, "error": str(e), "headers": {}, "raw_preview": ""}
 
+    # 1) Proxy com render (se houver proxy)
+    if USE_PROXY:
+        target1 = build_target(raw, force_params={"js_render": "true"})
+        st1, tx1, hd1 = await get_text(target1, ua_hdrs)
+        tries.append({"status": st1, "target": target1, "headers": hd1, "raw_preview": tx1[:600], "html": tx1})
+
+        # 2) Proxy sem render (fallback)
+        if st1 >= 400 or len(tx1) < 1000:
+            target2 = build_target(raw, force_params={"js_render": "false"})
+            st2, tx2, hd2 = await get_text(target2, ua_hdrs)
+            tries.append({"status": st2, "target": target2, "headers": hd2, "raw_preview": tx2[:600], "html": tx2})
+
+    # 3) Tentar DIRETO (sem proxy) — MUITO ÚTIL quando proxy é marcado como bot
+    st3, tx3, hd3 = await get_text(raw, ua_hdrs)
+    tries.append({"status": st3, "target": raw, "headers": hd3, "raw_preview": tx3[:600], "html": tx3})
+
+    return tries
+
 @app.get("/meli/search")
 async def meli_search(q: str = Query(..., description="Produto a buscar (API JSON ML)")):
     meli = await fetch_meli_json(q)
@@ -144,27 +162,34 @@ async def meli_search(q: str = Query(..., description="Produto a buscar (API JSO
 
 # ---- Plano B: HTML público (com extractor de JSON inline) ----
 def extract_from_inline_json(html: str) -> list[dict]:
-    """Extrai itens de blobs JSON embutidos na página (ex.: __PRELOADED_STATE__, __NEXT_DATA__, etc.)."""
+    """
+    Procura blobs JSON comuns em páginas do ML (pré-carregados ou em bundles).
+    """
     items: list[dict] = []
 
-    # Busca um blob grande com "results":[{...}] ou variáveis globais comuns
+    # A) window.__PRELOADED_STATE__ = {...}
     m = re.search(r"__PRELOADED_STATE__\s*=\s*({.*?});\s*</script>", html, flags=re.S)
+    # B) __NEXT_DATA__
     if not m:
         m = re.search(r"__NEXT_DATA__\"\s*:\s*({.*?})\s*</script>", html, flags=re.S)
+    # C) Qualquer blob que contenha results/permalink/title (bem permissivo)
     if not m:
         m = re.search(r"(\{[^<>{}]*\"results\"\s*:\s*\[.*?\}\])", html, flags=re.S)
+    if not m:
+        m = re.search(r"(\{[^<>{}]*\"permalink\"\s*:\s*\"https?://[^\"}]+\".*?\})", html, flags=re.S)
 
     if not m:
         return items
 
     blob = m.group(1).replace("\\u002F", "/")
 
+    # Captura chaves usuais
     links   = re.findall(r'"permalink"\s*:\s*"([^"]+)"', blob)
     titles  = re.findall(r'"title"\s*:\s*"([^"]+)"', blob)
     prices  = re.findall(r'"price"\s*:\s*([0-9]+)', blob)
     thumbs  = re.findall(r'"thumbnail"\s*:\s*"([^"]+)"', blob)
 
-    n = max(len(links), len(titles), len(prices), len(thumbs))
+    n = max(len(links), len(titles), len(prices), len(thumbs), 0)
     for i in range(n):
         link  = normalize_link(links[i]) if i < len(links)  else None
         title = (titles[i] if i < len(titles) else "").strip()
