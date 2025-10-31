@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 from urllib.parse import quote_plus, urlencode
 from bs4 import BeautifulSoup
+import html as html_unescape
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -111,7 +113,7 @@ async def meli_search(q: str = Query(..., description="Produto a buscar (API JSO
     seo_text = "(IA desativada: defina GOOGLE_API_KEY)"
     if GOOGLE_KEY:
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel("models/gemini-1.5-flash-latest")
             seo_text = model.generate_content(make_prompt(q, results)).text
         except Exception as e:
             seo_text = f"(Falha ao gerar SEO: {e})"
@@ -123,7 +125,7 @@ def parse_ml_list_html(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     items: list[dict] = []
 
-    # A) JSON-LD (ItemList)
+    # --- A) JSON-LD (ItemList) ---
     for s in soup.find_all("script", {"type": "application/ld+json"}):
         txt = (s.string or s.text or "").strip()
         if not txt:
@@ -132,19 +134,74 @@ def parse_ml_list_html(html: str) -> list[dict]:
             data = json.loads(txt)
         except Exception:
             continue
+
         if isinstance(data, dict) and ("itemListElement" in data or data.get("@type") == "ItemList"):
             for el in data.get("itemListElement", []):
                 node = el.get("item") if isinstance(el, dict) else None
                 if not isinstance(node, dict):
                     continue
-                title = node.get("name")
-                link  = node.get("url")
+                title = (node.get("name") or "").strip()
+                link  = normalize_link(node.get("url"))
+                if not title or title in BAD_TITLES:
+                    continue
+                if not is_product_link(link):
+                    continue
+                price = None
                 offer = node.get("offers") or {}
-                price = offer.get("price")
-                if title and link:
-                    items.append({"title": title, "price": price_to_number(str(price)) if price else None, "link": link, "thumbnail": None})
+                if isinstance(offer, dict) and offer.get("price") is not None:
+                    price = price_to_number(str(offer.get("price")))
+                items.append({"title": title, "price": price, "link": link, "thumbnail": None})
+
     if items:
         return items[:12]
+
+    # --- B) Seletores de cartão (HTML) ---
+    cards = soup.select(
+        '[data-testid="product"], .ui-search-result__wrapper, .ui-search-layout__item, li.ui-search-layout__item'
+    )
+    for c in cards:
+        a = c.select_one('a[href*="mercadolivre.com"]') or c.find("a", href=True)
+        href = normalize_link(a.get("href") if a else None)
+
+        title_el = c.select_one('[data-testid="product-title"], h2.ui-search-item__title, .ui-search-item__title')
+        title = (title_el.get_text(strip=True) if title_el else "").strip()
+
+        if not title or title in BAD_TITLES:
+            continue
+        if not is_product_link(href):
+            continue
+
+        img_el = c.select_one('img[data-src], img[src]')
+        thumb = normalize_link((img_el.get("data-src") or img_el.get("src")) if img_el else None)
+
+        price_el = c.select_one('.andes-money-amount__fraction, [data-testid="price"], span.ui-search-price__part')
+        price_txt = price_el.get_text(strip=True) if price_el else None
+        price = price_to_number(price_txt)
+
+        items.append({"title": title, "price": price, "link": href, "thumbnail": thumb})
+        if len(items) >= 12:
+            break
+
+    if items:
+        return items
+
+    # --- C) Regex fallback (quando o HTML traz JSON inline com results) ---
+    # Ex.: "permalink":"https://produto.mercadolivre.com.br/MLB-..."
+    links  = re.findall(r'"permalink"\s*:\s*"([^"]+)"', html)
+    titles = re.findall(r'"title"\s*:\s*"([^"]+)"', html)
+    prices = re.findall(r'"price"\s*:\s*([0-9]+)', html)
+
+    for i, link in enumerate(links[:20]):
+        link = normalize_link(link)
+        title = (titles[i] if i < len(titles) else "").strip()
+        if not title or title in BAD_TITLES or not is_product_link(link):
+            continue
+        price = int(prices[i]) if i < len(prices) else None
+        items.append({"title": title, "price": price, "link": link, "thumbnail": None})
+        if len(items) >= 12:
+            break
+
+    return items
 
     # B) Seletores de cartão
     cards = soup.select('[data-testid="product"], .ui-search-result__wrapper, .ui-search-layout__item, li.ui-search-layout__item')
@@ -176,6 +233,31 @@ def parse_ml_list_html(html: str) -> list[dict]:
             items.append({"title": title, "price": price, "link": link, "thumbnail": None})
     return items
 
+BAD_TITLES = {
+    "Publicidade", "Buscas relacionadas", "Perguntas relacionadas",
+    "Tudo sobre", "Resumo dos Prós e Contras do iPhone"
+}
+
+def normalize_link(u: str | None) -> str | None:
+    if not u:
+        return None
+    # troca \u002F por / e remove placeholders $query
+    u = u.replace("\\u002F", "/").replace("$query_NoIndex_True", "").replace("$query", "")
+    u = html_unescape.unescape(u)
+    return u
+
+def is_product_link(u: str | None) -> bool:
+    if not u:
+        return False
+    try:
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+        # produto geralmente é "produto.mercadolivre.com.br/MLB-..." ou ".../MLB-...."
+        return ("mercadolivre.com.br" in host) and ("mlb-" in path or "produto.mercadolivre.com.br" in host)
+    except Exception:
+        return False
+    
 async def fetch_meli_html(query: str):
     raw = f"https://lista.mercadolivre.com.br/{quote_plus(query)}"
     ua_hdrs = {
