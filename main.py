@@ -89,158 +89,133 @@ def debug_env():
     }
 
 # ========= Plano A (API JSON oficial) — continua aqui, mas pode falhar =========
-async def fetch_meli_json(query: str):
-    base = "https://api.mercadolibre.com/sites/MLB/search"
-    raw  = f"{base}?q={quote_plus(query)}&limit=5"
-    target = build_target(raw)
-    headers = {
-        "User-Agent": "ecom-seo/1.0",
-        "Accept": "application/json",
-    }
-    try:
-        status, text, hdrs = await get_text(target, headers)
-        data = None
-        try:
-            data = json.loads(text)
-        except Exception:
-            data = None
-        return {
-            "status": status,
-            "headers": hdrs,
-            "target": target,
-            "raw_preview": text[:800],
-            "json": data,
-        }
-    except Exception as e:
-        return {"status": 0, "target": target, "error": str(e), "headers": {}, "raw_preview": ""}
-
-@app.get("/meli/search")
-async def meli_search(q: str = Query(..., description="Produto a buscar")):
-    meli = await fetch_meli_json(q)
-    if meli["status"] != 200 or not isinstance(meli.get("json"), dict):
-        return {"message": "Mercado Livre não retornou JSON válido.", "diagnostic": meli}
-
-    results = []
-    for item in meli["json"].get("results", []):
-        results.append({
-            "title": item.get("title"),
-            "price": item.get("price"),
-            "link": item.get("permalink"),
-            "thumbnail": item.get("thumbnail"),
-        })
-
-    if not results:
-        return {"message": "Sem resultados ou bloqueado.", "meli_status": meli["status"], "meli_preview": meli["raw_preview"]}
-
-    seo_text = "(IA desativada: defina GOOGLE_API_KEY no .env)"
-    if GOOGLE_KEY:
-        try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            seo_text = model.generate_content(make_prompt(q, results)).text
-        except Exception as e:
-            seo_text = f"(Falha ao gerar SEO: {e})"
-
-    return {"query": q, "results": results, "seo_text": seo_text}
-
-# ========= Plano B (HTML público) — NOVO =========
-
-def parse_ml_list_html(html: str) -> list[dict]:
-    """
-    Faz o parsing dos cards de resultado da busca pública do Mercado Livre.
-    Usa seletores tolerantes a mudanças de classe.
-    """
-    soup = BeautifulSoup(html, "lxml")
-
-    # Os cards geralmente possuem data-testid="product" OU classes 'ui-search-result__wrapper' etc.
-    cards = soup.select('[data-testid="product"], .ui-search-result__wrapper, .ui-search-layout__item')
-    items: list[dict] = []
-
-    for c in cards:
-        # Link (Âncora principal)
-        a = c.select_one('a[href*="mercadolivre.com"], a.ui-search-item__group__element.ui-search-link, a.ui-search-result__content')
-        href = a.get("href") if a else None
-
-        # Título
-        title_el = c.select_one('[data-testid="product-title"], h2.ui-search-item__title, .ui-search-item__title')
-        title = title_el.get_text(strip=True) if title_el else None
-
-        # Imagem
-        img_el = c.select_one('img[data-src], img[src]')
-        thumb = (img_el.get("data-src") or img_el.get("src")) if img_el else None
-
-        # Preço (fração)
-        price_el = c.select_one('.andes-money-amount__fraction, [data-testid="price"]')
-        price_txt = price_el.get_text(strip=True) if price_el else None
-        price = price_to_number(price_txt)
-
-        if href and title:
-            items.append({
-                "title": title,
-                "price": price,
-                "link": href,
-                "thumbnail": thumb,
-            })
-
-        if len(items) >= 10:
-            break
-
-    return items
-
 async def fetch_meli_html(query: str):
-    """
-    Busca a lista pública (HTML) do Mercado Livre. Tenta sem JS; se falhar, força js_render=true.
-    """
-    # URL pública de busca (HTML)
-    # Exemplos que funcionam: https://lista.mercadolivre.com.br/iphone
     raw = f"https://lista.mercadolivre.com.br/{quote_plus(query)}"
 
     ua_hdrs = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
     }
 
-    # 1) tentativa com o que vier do ML_PROXY_EXTRA (ou sem proxy)
-    target1 = build_target(raw)
-    st1, tx1, hd1 = await get_text(target1, ua_hdrs)
+    # 1ª tentativa já com js_render=true (quando tiver proxy)
+    if USE_PROXY:
+        target = build_target(raw, force_params={"js_render": "true"})
+    else:
+        target = raw
 
-    # Se falhou no proxy com RESP/403/etc ou HTML vazio, força render JS (quando houver proxy)
-    if (USE_PROXY and (st1 >= 400 or len(tx1) < 1000)):
-        target2 = build_target(raw, force_params={"js_render": "true"})
+    st1, tx1, hd1 = await get_text(target, ua_hdrs)
+    tries = [{"status": st1, "target": target, "headers": hd1, "raw_preview": tx1[:600], "html": tx1}]
+
+    # Se veio muito curto ou erro, tenta sem js_render (inverte)
+    if (st1 >= 400 or len(tx1) < 1000) and USE_PROXY:
+        target2 = build_target(raw, force_params={"js_render": "false"})
         st2, tx2, hd2 = await get_text(target2, ua_hdrs)
-        return [
-            {"status": st1, "target": target1, "headers": hd1, "raw_preview": tx1[:400]},
-            {"status": st2, "target": target2, "headers": hd2, "raw_preview": tx2[:400], "html": tx2},
-        ]
+        tries.append({"status": st2, "target": target2, "headers": hd2, "raw_preview": tx2[:600], "html": tx2})
 
-    return [
-        {"status": st1, "target": target1, "headers": hd1, "raw_preview": tx1[:400], "html": tx1},
-    ]
+    return tries
 
-@app.get("/meli/search_html")
-async def meli_search_html(q: str = Query(..., description="Produto a buscar (HTML)")):
-    traces = await fetch_meli_html(q)
 
-    # escolhe o melhor html válido dentre as tentativas
-    html = None
-    for t in reversed(traces):  # prioriza a última tentativa (com js_render=true)
-        if t.get("html") and "<html" in t["html"].lower():
-            html = t["html"]
+# ========= Plano B (HTML público) — NOVO =========
+
+def parse_ml_list_html(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    items: list[dict] = []
+
+    # --- A) JSON-LD (ItemList) ---
+    for s in soup.find_all("script", {"type": "application/ld+json"}):
+        txt = (s.string or s.text or "").strip()
+        if not txt:
+            continue
+        try:
+            data = json.loads(txt)
+        except Exception:
+            # às vezes vem múltiplos JSONs concatenados; tenta por regex de blocos {...}
+            for m in re.finditer(r"\{.*?\}", txt, flags=re.S):
+                try:
+                    data = json.loads(m.group(0))
+                except Exception:
+                    continue
+                else:
+                    # processa bloco encontrado
+                    if isinstance(data, dict) and ("itemListElement" in data or data.get("@type") == "ItemList"):
+                        for el in data.get("itemListElement", []):
+                            node = el.get("item") if isinstance(el, dict) else None
+                            if not isinstance(node, dict):
+                                continue
+                            title = node.get("name")
+                            link  = node.get("url")
+                            offer = node.get("offers") or {}
+                            price = offer.get("price")
+                            thumb = None
+                            if title and link:
+                                items.append({
+                                    "title": title,
+                                    "price": price_to_number(str(price)) if price else None,
+                                    "link": link,
+                                    "thumbnail": thumb,
+                                })
+                    continue
+            continue  # não era JSON útil
+        # JSON válido direto
+        if isinstance(data, dict) and ("itemListElement" in data or data.get("@type") == "ItemList"):
+            for el in data.get("itemListElement", []):
+                node = el.get("item") if isinstance(el, dict) else None
+                if not isinstance(node, dict):
+                    continue
+                title = node.get("name")
+                link  = node.get("url")
+                offer = node.get("offers") or {}
+                price = offer.get("price")
+                thumb = None
+                if title and link:
+                    items.append({
+                        "title": title,
+                        "price": price_to_number(str(price)) if price else None,
+                        "link": link,
+                        "thumbnail": thumb,
+                    })
+
+    # se já coletou itens pelo JSON-LD, retorna (limita 12)
+    if items:
+        return items[:12]
+
+    # --- B) Seletores de cartão (HTML) ---
+    cards = soup.select('[data-testid="product"], .ui-search-result__wrapper, .ui-search-layout__item, li.ui-search-layout__item')
+    for c in cards:
+        a = c.select_one('a[href*="mercadolivre.com"]') or c.find("a", href=True)
+        href = a["href"] if a and a.has_attr("href") else None
+
+        title_el = c.select_one('[data-testid="product-title"], h2.ui-search-item__title, .ui-search-item__title')
+        title = title_el.get_text(strip=True) if title_el else None
+
+        img_el = c.select_one('img[data-src], img[src]')
+        thumb = (img_el.get("data-src") or img_el.get("src")) if img_el else None
+
+        price_el = c.select_one('.andes-money-amount__fraction, [data-testid="price"], span.ui-search-price__part')
+        price_txt = price_el.get_text(strip=True) if price_el else None
+        price = price_to_number(price_txt)
+
+        if href and title:
+            items.append({"title": title, "price": price, "link": href, "thumbnail": thumb})
+        if len(items) >= 12:
             break
 
-    if not html:
-        return {"message": "Não foi possível obter HTML da busca.", "tries": traces}
+    if items:
+        return items
 
-    results = parse_ml_list_html(html)
-    if not results:
-        return {"message": "HTML obtido, mas nenhum item foi parseado.", "tries": traces[:1], "html_preview": html[:500]}
+    # --- C) Regex bruto como último recurso ---
+    # Busca pares "permalink","title","price" dentro do HTML
+    # (não é perfeito, mas salva quando o layout muda muito)
+    # permalink
+    links = re.findall(r'"permalink"\s*:\s*"([^"]+)"', html)
+    titles = re.findall(r'"title"\s*:\s*"([^"]+)"', html)
+    prices = re.findall(r'"price"\s*:\s*([0-9]+)', html)
 
-    # IA (opcional)
-    seo_text = "(IA desativada: defina GOOGLE_API_KEY no .env)"
-    if GOOGLE_KEY:
-        try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            seo_text = model.generate_content(make_prompt(q, results)).text
-        except Exception as e:
-            seo_text = f"(Falha ao gerar SEO: {e})"
+    for i, link in enumerate(links[:12]):
+        title = titles[i] if i < len(titles) else None
+        price = int(prices[i]) if i < len(prices) else None
+        if title and link:
+            items.append({"title": title, "price": price, "link": link, "thumbnail": None})
 
-    return {"query": q, "results": results, "seo_text": seo_text}
+    return items
